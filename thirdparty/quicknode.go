@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,7 @@ type QuicknodeVendor struct {
 	common.Vendor
 
 	remoteDataLock          sync.RWMutex
-	remoteData              map[string][]*QuicknodeEndpoint
+	remoteData              map[string][]*QuicknodeEndpoint // key is apiKey + filter params hash
 	remoteDataLastFetchedAt map[string]time.Time
 }
 
@@ -89,6 +90,36 @@ func (v *QuicknodeVendor) extractFilterParams(settings common.VendorSettings) *Q
 	return params
 }
 
+func (v *QuicknodeVendor) getCacheKey(apiKey string, params *QuicknodeFilterParams) string {
+	key := apiKey
+	if params == nil {
+		return key
+	}
+
+	if len(params.TagIDs) > 0 {
+		// Sort for deterministic cache keys regardless of input order
+		ids := make([]int, len(params.TagIDs))
+		copy(ids, params.TagIDs)
+		sort.Ints(ids)
+
+		idStrs := make([]string, len(ids))
+		for i, id := range ids {
+			idStrs[i] = strconv.Itoa(id)
+		}
+		key += "_tid:" + strings.Join(idStrs, ",")
+	}
+
+	if len(params.TagLabels) > 0 {
+		// Sort for deterministic cache keys regardless of input order
+		labels := make([]string, len(params.TagLabels))
+		copy(labels, params.TagLabels)
+		sort.Strings(labels)
+		key += "_tl:" + strings.Join(labels, ",")
+	}
+
+	return key
+}
+
 func (v *QuicknodeVendor) SupportsNetwork(ctx context.Context, logger *zerolog.Logger, settings common.VendorSettings, networkId string) (bool, error) {
 	if !strings.HasPrefix(networkId, "evm:") {
 		return false, nil
@@ -112,15 +143,16 @@ func (v *QuicknodeVendor) SupportsNetwork(ctx context.Context, logger *zerolog.L
 
 	// Extract tag filtering settings
 	filterParams := v.extractFilterParams(settings)
+	cacheKey := v.getCacheKey(apiKey, filterParams)
 
-	err = v.ensureRefreshEndpoints(ctx, logger, apiKey, recheckInterval, filterParams)
+	err = v.ensureRefreshEndpoints(ctx, logger, cacheKey, recheckInterval, filterParams)
 	if err != nil {
 		logger.Warn().Err(err).Msg("failed to refresh QuickNode endpoints")
 		return false, err
 	}
 
 	v.remoteDataLock.RLock()
-	endpoints := v.remoteData[apiKey]
+	endpoints := v.remoteData[cacheKey]
 	v.remoteDataLock.RUnlock()
 
 	for _, endpoint := range endpoints {
@@ -159,15 +191,16 @@ func (v *QuicknodeVendor) GenerateConfigs(ctx context.Context, logger *zerolog.L
 
 		// Extract tag filtering settings
 		filterParams := v.extractFilterParams(settings)
+		cacheKey := v.getCacheKey(apiKey, filterParams)
 
-		err := v.ensureRefreshEndpoints(ctx, &log.Logger, apiKey, recheckInterval, filterParams)
+		err := v.ensureRefreshEndpoints(ctx, &log.Logger, cacheKey, recheckInterval, filterParams)
 		if err != nil {
 			log.Warn().Err(err).Msg("failed to refresh QuickNode endpoints, falling back to static endpoint generation")
 			return nil, err
 		}
 
 		v.remoteDataLock.RLock()
-		endpoints := v.remoteData[apiKey]
+		endpoints := v.remoteData[cacheKey]
 		v.remoteDataLock.RUnlock()
 
 		var upstreams []*common.UpstreamConfig
@@ -192,20 +225,29 @@ func (v *QuicknodeVendor) GenerateConfigs(ctx context.Context, logger *zerolog.L
 	}
 }
 
-func (v *QuicknodeVendor) ensureRefreshEndpoints(ctx context.Context, logger *zerolog.Logger, apiKey string, recheckInterval time.Duration, filterParams *QuicknodeFilterParams) error {
+func (v *QuicknodeVendor) ensureRefreshEndpoints(ctx context.Context, logger *zerolog.Logger, cacheKey string, recheckInterval time.Duration, filterParams *QuicknodeFilterParams) error {
 	v.remoteDataLock.Lock()
 	defer v.remoteDataLock.Unlock()
 
 	// Check if we've fetched recently
-	if lastFetch, ok := v.remoteDataLastFetchedAt[apiKey]; ok && time.Since(lastFetch) < recheckInterval {
+	if lastFetch, ok := v.remoteDataLastFetchedAt[cacheKey]; ok && time.Since(lastFetch) < recheckInterval {
 		return nil
+	}
+
+	apiKey := cacheKey
+	// Extract API key from cache key by looking for filter delimiters (_tid: or _tl:)
+	// Don't use simple underscore split as API keys may contain underscores
+	if idx := strings.Index(cacheKey, "_tid:"); idx > 0 {
+		apiKey = cacheKey[:idx]
+	} else if idx := strings.Index(cacheKey, "_tl:"); idx > 0 {
+		apiKey = cacheKey[:idx]
 	}
 
 	// Fetch endpoints from API
 	endpoints, err := v.fetchEndpoints(ctx, apiKey, filterParams)
 	if err != nil {
 		// Keep stale data if fetch fails
-		if _, hasData := v.remoteData[apiKey]; hasData {
+		if _, hasData := v.remoteData[cacheKey]; hasData {
 			logger.Warn().Err(err).Msg("could not refresh QuickNode endpoints data; will use stale data")
 			return nil
 		}
@@ -219,8 +261,8 @@ func (v *QuicknodeVendor) ensureRefreshEndpoints(ctx context.Context, logger *ze
 	}
 
 	// Update cache
-	v.remoteData[apiKey] = endpoints
-	v.remoteDataLastFetchedAt[apiKey] = time.Now()
+	v.remoteData[cacheKey] = endpoints
+	v.remoteDataLastFetchedAt[cacheKey] = time.Now()
 
 	return nil
 }
